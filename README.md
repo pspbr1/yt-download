@@ -143,7 +143,3 @@ chmod +x youtube_media_downloader.py
 - Verificar se o vídeo não é privado
 - Alguns vídeos têm restrições geográficas
 - Tentar com VPN se necessário
-
-## Licença
-
-MIT License - uso educacional e pessoal. Respeite direitos autorais do YouTube.
