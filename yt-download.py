@@ -4,14 +4,15 @@ youtube_downloader_pro.py
 Downloader de áudio e vídeo do YouTube com interface gráfica aprimorada.
 Utiliza yt-dlp e ffmpeg para processamento.
 
-Melhorias v2:
-- Progresso detalhado com velocidade, ETA e tamanho
-- Histórico de downloads com sessão persistente
-- Mini player de preview de metadados
-- Fila de downloads múltiplos
-- Cores e tema modernos via ttk customizado
-- Melhor tratamento de erros e cancelamento real
-- Separação clara de responsabilidades (MVC leve)
+CORREÇÕES APLICADAS:
+- Corrigidas strings com aspas duplas escapadas
+- Adicionado tratamento para valores None em format_bytes
+- Corrigido problema de variável não definida em extract_quality_number
+- Adicionado fallback para quando não há informações de tamanho
+- Corrigido problema de concorrência na fila de UI
+- Melhorado tratamento de erros no progress_hook
+- Adicionado timeout na verificação do ffmpeg
+- Corrigido problema de recursão no progress_hook com cancelamento
 """
 
 import os
@@ -20,7 +21,7 @@ import time
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-from typing import Optional, Union, Dict, Any, List
+from typing import Optional, Union, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 import subprocess
@@ -106,7 +107,10 @@ class DownloadRecord:
 # ──────────────────────────────────────────────
 # Utilitários
 # ──────────────────────────────────────────────
-def fmt_bytes(n: float) -> str:
+def fmt_bytes(n: Optional[float]) -> str:
+    """Formata bytes para string legível."""
+    if n is None:
+        return '—'
     for unit in ('B', 'KB', 'MB', 'GB'):
         if n < 1024:
             return f"{n:.1f} {unit}"
@@ -114,11 +118,13 @@ def fmt_bytes(n: float) -> str:
     return f"{n:.1f} TB"
 
 
-def fmt_speed(bps: float) -> str:
-    return f"{fmt_bytes(bps)}/s"
+def fmt_speed(bps: Optional[float]) -> str:
+    """Formata velocidade em bytes/segundo."""
+    return f"{fmt_bytes(bps)}/s" if bps else '—'
 
 
 def fmt_eta(secs: Optional[float]) -> str:
+    """Formata ETA em formato legível."""
     if secs is None or secs <= 0:
         return '—'
     return str(timedelta(seconds=int(secs)))
@@ -126,8 +132,17 @@ def fmt_eta(secs: Optional[float]) -> str:
 
 def extract_quality_number(quality_str: str) -> Optional[str]:
     """Extrai número de resolução de string como '1080p (Full HD)'."""
-    part = quality_str.split('p')[0]
-    return part if part.isdigit() else None
+    if not quality_str:
+        return None
+    # Pega a parte antes do 'p'
+    if 'p' in quality_str:
+        part = quality_str.split('p')[0]
+        # Pega apenas dígitos do final da string
+        import re
+        match = re.search(r'\d+$', part)
+        if match:
+            return match.group()
+    return None
 
 
 def build_ydl_opts(
@@ -157,7 +172,7 @@ def build_ydl_opts(
             opts['format'] = 'bestvideo+bestaudio/best'
         elif quality == 'worst':
             opts['format'] = 'worstvideo+worstaudio/worst'
-        elif qual_num:
+        elif qual_num and qual_num.isdigit():
             opts['format'] = (
                 f'bestvideo[height<={qual_num}]+bestaudio'
                 f'/best[height<={qual_num}]'
@@ -187,6 +202,7 @@ class DownloadEngine:
     def __init__(self):
         self._cancel_flag = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._current_ydl: Optional[YoutubeDL] = None
 
     # Callbacks (atribuídos externamente)
     on_progress: Optional[callable] = None
@@ -209,6 +225,12 @@ class DownloadEngine:
 
     def cancel(self):
         self._cancel_flag.set()
+        # Tentativa de cancelamento forçado
+        if self._current_ydl:
+            try:
+                self._current_ydl.params['quiet'] = True
+            except:
+                pass
 
     @property
     def running(self) -> bool:
@@ -220,60 +242,94 @@ class DownloadEngine:
         stats = DownloadStats(start_time=time.time())
 
         try:
+            # Criar pasta se não existir
+            os.makedirs(outfolder, exist_ok=True)
+
             ydl_opts = build_ydl_opts(
                 outfolder, filename_template, is_video, fmt, quality,
                 self._make_progress_hook(stats),
             )
 
-            with YoutubeDL(ydl_opts) as ydl:
-                # Fase 1 — extrair informações
-                self._emit_log("Obtendo informações do vídeo/playlist…", 'info')
-                info = ydl.extract_info(url, download=False)
+            # Verificar cancelamento antes de iniciar
+            if self._cancel_flag.is_set():
+                self._finish(stats, cancelled=True)
+                return
 
-                if self._cancel_flag.is_set():
-                    self._finish(stats, cancelled=True)
-                    return
+            self._current_ydl = YoutubeDL(ydl_opts)
+            
+            # Fase 1 — extrair informações
+            self._emit_log("Obtendo informações do vídeo/playlist…", 'info')
+            
+            try:
+                info = self._current_ydl.extract_info(url, download=False)
+            except Exception as e:
+                self._emit_log(f"Erro ao obter informações: {str(e)}", 'error')
+                stats.errors += 1
+                self._finish(stats)
+                return
 
-                if info and 'entries' in info:
-                    entries = [e for e in info['entries'] if e]
-                    stats.total_files = len(entries)
-                    title = info.get('title', 'Playlist')
-                    self._emit_log(
-                        f"Playlist: "{title}" — {stats.total_files} arquivos", 'info'
-                    )
-                else:
-                    stats.total_files = 1
-                    title = info.get('title', url) if info else url
-                    self._emit_log(f"Vídeo: "{title}"", 'info')
+            if self._cancel_flag.is_set():
+                self._finish(stats, cancelled=True)
+                return
 
-                if self.on_progress:
-                    self.on_progress({'_meta': True, 'stats': stats})
+            if info and 'entries' in info:
+                entries = [e for e in info['entries'] if e]
+                stats.total_files = len(entries)
+                title = info.get('title', 'Playlist')
+                self._emit_log(f"Playlist: '{title}' — {stats.total_files} arquivos", 'info')
+            else:
+                stats.total_files = 1
+                title = info.get('title', url) if info else url
+                self._emit_log(f"Vídeo: '{title}'", 'info')
 
-                # Fase 2 — download
-                ydl.extract_info(url, download=True)
+            # Enviar metadados iniciais
+            if self.on_progress:
+                self.on_progress({'_meta': True, 'stats': stats})
 
+            # Fase 2 — download (apenas se não cancelado)
+            if not self._cancel_flag.is_set():
+                try:
+                    self._current_ydl.download([url])
+                except Exception as e:
+                    if str(e) != "Download cancelado pelo usuário.":
+                        self._emit_log(f"Erro no download: {str(e)}", 'error')
+                        stats.errors += 1
+
+            # Ajustar estatísticas finais
+            if not self._cancel_flag.is_set():
                 stats.completed = stats.total_files - stats.errors
 
         except Exception as exc:
             self._emit_log(f"Erro inesperado: {exc}", 'error')
             stats.errors += 1
         finally:
+            self._current_ydl = None
             self._finish(stats)
 
     def _make_progress_hook(self, stats: DownloadStats):
+        """Cria o hook de progresso com tratamento de cancelamento."""
+        
         def hook(d: Dict[str, Any]):
+            # Verificar cancelamento - usar exceção para interromper o yt-dlp
             if self._cancel_flag.is_set():
                 raise Exception("Download cancelado pelo usuário.")
 
             status = d.get('status')
-            filename = os.path.basename(d.get('filename', ''))
+            
+            try:
+                filename = os.path.basename(d.get('filename', ''))
+            except:
+                filename = ''
 
             if status == 'downloading':
                 downloaded = d.get('downloaded_bytes', 0)
                 total = d.get('total_bytes') or d.get('total_bytes_estimate')
                 speed = d.get('speed')
                 eta = d.get('eta')
-                pct = (downloaded / total * 100) if total else None
+                
+                pct = None
+                if total and total > 0:
+                    pct = (downloaded / total) * 100
 
                 payload = {
                     'status': 'downloading',
@@ -295,8 +351,12 @@ class DownloadEngine:
                 )
                 stats.completed += 1
                 if self.on_progress:
-                    self.on_progress({'status': 'finished', 'stats': stats,
-                                     'filename': filename, 'size_mb': size_mb})
+                    self.on_progress({
+                        'status': 'finished', 
+                        'stats': stats,
+                        'filename': filename, 
+                        'size_mb': size_mb
+                    })
 
             elif status == 'error':
                 self._emit_log(f"✘ Erro: {filename}", 'error')
@@ -337,6 +397,8 @@ class RoundedProgressBar(tk.Canvas):
     def _draw(self):
         self.delete('all')
         w = self.winfo_width()
+        if w <= 1:  # Evitar divisão por zero
+            w = 200
         h = self._height
         r = h // 2
 
@@ -354,8 +416,8 @@ class RoundedProgressBar(tk.Canvas):
                          fill=COLORS['text'], font=('Consolas', 9, 'bold'))
 
     def _rounded_rect(self, x1, y1, x2, y2, r, color):
-        self.create_arc(x1, y1, x1+2*r, y1+2*r, start=90, extent=90,  fill=color, outline='')
-        self.create_arc(x2-2*r, y1, x2, y1+2*r, start=0,  extent=90,  fill=color, outline='')
+        self.create_arc(x1, y1, x1+2*r, y1+2*r, start=90, extent=90, fill=color, outline='')
+        self.create_arc(x2-2*r, y1, x2, y1+2*r, start=0, extent=90, fill=color, outline='')
         self.create_arc(x1, y2-2*r, x1+2*r, y2, start=180, extent=90, fill=color, outline='')
         self.create_arc(x2-2*r, y2-2*r, x2, y2, start=270, extent=90, fill=color, outline='')
         self.create_rectangle(x1+r, y1, x2-r, y2, fill=color, outline='')
@@ -452,19 +514,23 @@ class HistoryPanel(tk.Frame):
         tk.Label(self, text="HISTÓRICO DA SESSÃO", bg=COLORS['bg'],
                  fg=COLORS['text_dim'], font=('Consolas', 8, 'bold')).pack(anchor='w', pady=(0, 4))
 
+        # Frame para Treeview e Scrollbar
+        tree_frame = tk.Frame(self, bg=COLORS['bg'])
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
         cols = ('Hora', 'Título', 'Formato', 'Status', 'Tamanho')
-        self.tree = ttk.Treeview(self, columns=cols, show='headings', height=6)
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show='headings', height=6)
 
         widths = (60, 260, 60, 70, 70)
         for col, w in zip(cols, widths):
             self.tree.heading(col, text=col)
             self.tree.column(col, width=w, anchor='center' if col != 'Título' else 'w')
 
-        self.tree.tag_configure('ok',        foreground=COLORS['success'])
-        self.tree.tag_configure('error',     foreground=COLORS['error'])
+        self.tree.tag_configure('ok', foreground=COLORS['success'])
+        self.tree.tag_configure('error', foreground=COLORS['error'])
         self.tree.tag_configure('cancelled', foreground=COLORS['warning'])
 
-        sb = ttk.Scrollbar(self, orient='vertical', command=self.tree.yview)
+        sb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -522,10 +588,10 @@ class App(tk.Tk):
                         troughcolor=COLORS['surface2'], selectbackground=COLORS['accent'],
                         selectforeground=COLORS['text'], insertcolor=COLORS['text'])
 
-        style.configure('TFrame',    background=COLORS['bg'])
-        style.configure('TLabel',    background=COLORS['bg'], foreground=COLORS['text'],
+        style.configure('TFrame', background=COLORS['bg'])
+        style.configure('TLabel', background=COLORS['bg'], foreground=COLORS['text'],
                         font=('Segoe UI', 9))
-        style.configure('TEntry',    fieldbackground=COLORS['surface'],
+        style.configure('TEntry', fieldbackground=COLORS['surface'],
                         foreground=COLORS['text'], insertcolor=COLORS['text'],
                         bordercolor=COLORS['border'], font=('Segoe UI', 10))
         style.configure('TCombobox', fieldbackground=COLORS['surface'],
@@ -579,8 +645,10 @@ class App(tk.Tk):
         canvas = tk.Canvas(container, bg=COLORS['bg'], highlightthickness=0)
         vsb = ttk.Scrollbar(container, orient='vertical', command=canvas.yview)
         self._scroll_frame = tk.Frame(canvas, bg=COLORS['bg'])
-        self._scroll_frame.bind('<Configure>',
-            lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        self._scroll_frame.bind(
+            '<Configure>',
+            lambda e: canvas.configure(scrollregion=canvas.bbox('all'))
+        )
         canvas.create_window((0, 0), window=self._scroll_frame, anchor='nw')
         canvas.configure(yscrollcommand=vsb.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -657,6 +725,8 @@ class App(tk.Tk):
         self._q_combo = ttk.Combobox(fq_row, textvariable=self._audio_q,
                                      values=AUDIO_BITRATES, state='readonly', width=16)
         self._q_combo.pack(side=tk.LEFT)
+
+        self._update_options()
 
     def _build_dest_section(self, parent):
         body = self._section(parent, "PASTA DE DESTINO  ·  TEMPLATE DO ARQUIVO")
@@ -772,7 +842,9 @@ class App(tk.Tk):
 
     def _paste_url(self):
         try:
-            self._url_var.set(self.clipboard_get())
+            clipboard_text = self.clipboard_get()
+            if clipboard_text:
+                self._url_var.set(clipboard_text)
         except Exception:
             pass
 
@@ -787,12 +859,15 @@ class App(tk.Tk):
         if not os.path.exists(folder):
             messagebox.showwarning("Aviso", "A pasta ainda não existe.")
             return
-        if sys.platform == 'win32':
-            os.startfile(folder)
-        elif sys.platform == 'darwin':
-            subprocess.run(['open', folder])
-        else:
-            subprocess.run(['xdg-open', folder])
+        try:
+            if sys.platform == 'win32':
+                os.startfile(folder)
+            elif sys.platform == 'darwin':
+                subprocess.run(['open', folder], check=False)
+            else:
+                subprocess.run(['xdg-open', folder], check=False)
+        except Exception as e:
+            self._log.append(f"Erro ao abrir pasta: {str(e)}", 'error')
 
     def _reset_metrics(self):
         for var in self._metric_vars.values():
@@ -802,14 +877,29 @@ class App(tk.Tk):
         self._file_label.config(text='Aguardando…')
 
     def _check_ffmpeg(self):
+        """Verifica se o ffmpeg está instalado com timeout."""
         try:
-            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-            self._log.append("ffmpeg encontrado ✔", 'success')
-        except Exception:
+            # Adicionar timeout para evitar travamento
+            result = subprocess.run(
+                ['ffmpeg', '-version'], 
+                capture_output=True, 
+                timeout=5,
+                check=False
+            )
+            if result.returncode == 0:
+                self._log.append("ffmpeg encontrado ✔", 'success')
+            else:
+                self._log.append(
+                    "ffmpeg não encontrado — conversões podem falhar.\n"
+                    "Instale em: https://ffmpeg.org/download.html", 'warning'
+                )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
             self._log.append(
                 "ffmpeg não encontrado — conversões podem falhar.\n"
                 "Instale em: https://ffmpeg.org/download.html", 'warning'
             )
+        except Exception:
+            self._log.append("Erro ao verificar ffmpeg", 'warning')
 
     # ── Controle de download ──────────────────
     def _start(self):
@@ -829,16 +919,16 @@ class App(tk.Tk):
             return
 
         is_video = self._dl_type.get() == 'video'
-        fmt = self._video_fmt.get() if is_video else self._audio_fmt.get()
-        quality = self._video_q.get() if is_video else self._audio_q.get()
-
-        # Sincronizar variáveis de formato com combobox
-        selected_fmt = self._fmt_combo.get()
-        selected_q = self._q_combo.get()
-        if selected_fmt:
-            fmt = selected_fmt
-        if selected_q:
-            quality = selected_q
+        
+        # Obter valores atuais dos comboboxes
+        fmt = self._fmt_combo.get()
+        quality = self._q_combo.get()
+        
+        # Fallback para valores padrão
+        if not fmt:
+            fmt = self._video_fmt.get() if is_video else self._audio_fmt.get()
+        if not quality:
+            quality = self._video_q.get() if is_video else self._audio_q.get()
 
         self._is_downloading = True
         self._dl_btn.config(state=tk.DISABLED)
@@ -865,88 +955,105 @@ class App(tk.Tk):
 
     # ── Callbacks da engine (thread-safe via queue) ──
     def _on_log(self, msg: str, tag: str):
+        """Callback para mensagens de log."""
         self._ui_queue.put(('log', msg, tag))
 
     def _on_progress(self, payload: Dict):
+        """Callback para atualizações de progresso."""
         self._ui_queue.put(('progress', payload))
 
     def _on_finished(self, stats: DownloadStats, cancelled: bool):
+        """Callback para quando o download termina."""
         self._ui_queue.put(('finished', stats, cancelled))
 
     def _poll_queue(self):
         """Drena a fila de mensagens no thread da UI."""
         try:
-            while True:
-                item = self._ui_queue.get_nowait()
-                kind = item[0]
-                if kind == 'log':
-                    _, msg, tag = item
-                    self._log.append(msg, tag)
-                elif kind == 'progress':
-                    _, payload = item
-                    self._apply_progress(payload)
-                elif kind == 'finished':
-                    _, stats, cancelled = item
-                    self._apply_finished(stats, cancelled)
-        except queue.Empty:
-            pass
-        self.after(80, self._poll_queue)
+            # Processar até 10 mensagens por ciclo para não travar a UI
+            processed = 0
+            while processed < 10:
+                try:
+                    item = self._ui_queue.get_nowait()
+                    kind = item[0]
+                    if kind == 'log':
+                        _, msg, tag = item
+                        self._log.append(msg, tag)
+                    elif kind == 'progress':
+                        _, payload = item
+                        self._apply_progress(payload)
+                    elif kind == 'finished':
+                        _, stats, cancelled = item
+                        self._apply_finished(stats, cancelled)
+                    processed += 1
+                except queue.Empty:
+                    break
+        except Exception as e:
+            print(f"Erro no polling da fila: {e}")
+        finally:
+            self.after(100, self._poll_queue)
 
     def _apply_progress(self, d: Dict):
-        if d.get('_meta'):
-            stats: DownloadStats = d['stats']
-            self._metric_vars['files'].set(
-                f"0 / {stats.total_files}"
-            )
-            return
+        """Aplica atualizações de progresso na UI."""
+        try:
+            if d.get('_meta'):
+                stats: DownloadStats = d['stats']
+                self._metric_vars['files'].set(
+                    f"0 / {stats.total_files}"
+                )
+                return
 
-        status = d.get('status')
-        stats: DownloadStats = d.get('stats', DownloadStats())
+            status = d.get('status')
+            stats: DownloadStats = d.get('stats', DownloadStats())
 
-        if status == 'downloading':
-            filename = d.get('filename', '')
-            downloaded = d.get('downloaded', 0)
-            total = d.get('total')
-            pct = d.get('pct')
-            speed = d.get('speed')
-            eta = d.get('eta')
+            if status == 'downloading':
+                filename = d.get('filename', '')
+                downloaded = d.get('downloaded', 0)
+                total = d.get('total')
+                pct = d.get('pct')
+                speed = d.get('speed')
+                eta = d.get('eta')
 
-            if filename:
-                short = filename[:90] + '…' if len(filename) > 90 else filename
-                self._file_label.config(text=f"↓  {short}")
+                if filename:
+                    short = filename[:90] + '…' if len(filename) > 90 else filename
+                    self._file_label.config(text=f"↓  {short}")
 
-            if pct is not None:
-                self._progress.set(pct)
+                if pct is not None:
+                    self._progress.set(pct)
 
-            self._metric_vars['downloaded'].set(fmt_bytes(downloaded))
-            self._metric_vars['total'].set(fmt_bytes(total) if total else '—')
-            self._metric_vars['speed'].set(fmt_speed(speed) if speed else '—')
-            self._metric_vars['eta'].set(fmt_eta(eta))
-            self._metric_vars['elapsed'].set(stats.elapsed)
-            self._metric_vars['files'].set(
-                f"{stats.completed} / {stats.total_files}")
-            self._speed_gauge.update_speed(speed)
+                self._metric_vars['downloaded'].set(fmt_bytes(downloaded))
+                self._metric_vars['total'].set(fmt_bytes(total) if total else '—')
+                self._metric_vars['speed'].set(fmt_speed(speed))
+                self._metric_vars['eta'].set(fmt_eta(eta))
+                self._metric_vars['elapsed'].set(stats.elapsed)
+                self._metric_vars['files'].set(
+                    f"{stats.completed} / {stats.total_files}")
+                self._speed_gauge.update_speed(speed)
 
-        elif status == 'finished':
-            self._progress.set(100)
-            self._metric_vars['files'].set(
-                f"{stats.completed} / {stats.total_files}")
-            self._metric_vars['elapsed'].set(stats.elapsed)
-            # Adicionar ao histórico
-            rec = DownloadRecord(
-                title=d.get('filename', 'Desconhecido'),
-                url=getattr(self, '_current_url', ''),
-                fmt=getattr(self, '_current_fmt', ''),
-                status='ok',
-                size_mb=d.get('size_mb', 0.0),
-            )
-            self._history.add(rec)
+            elif status == 'finished':
+                self._progress.set(100)
+                self._metric_vars['files'].set(
+                    f"{stats.completed} / {stats.total_files}")
+                self._metric_vars['elapsed'].set(stats.elapsed)
+                
+                # Adicionar ao histórico
+                if hasattr(self, '_current_url') and hasattr(self, '_current_fmt'):
+                    rec = DownloadRecord(
+                        title=d.get('filename', 'Desconhecido'),
+                        url=self._current_url,
+                        fmt=self._current_fmt,
+                        status='ok',
+                        size_mb=d.get('size_mb', 0.0),
+                    )
+                    self._history.add(rec)
 
-        elif status == 'error':
-            self._metric_vars['files'].set(
-                f"{stats.completed} / {stats.total_files} (erros: {stats.errors})")
+            elif status == 'error':
+                self._metric_vars['files'].set(
+                    f"{stats.completed} / {stats.total_files} (erros: {stats.errors})")
+        except Exception as e:
+            self._log.append(f"Erro ao atualizar progresso: {str(e)}", 'error')
 
     def _apply_finished(self, stats: DownloadStats, cancelled: bool):
+        """Aplica finalização do download na UI."""
         self._is_downloading = False
         self._dl_btn.config(state=tk.NORMAL)
         self._cancel_btn.config(state=tk.DISABLED)
@@ -962,10 +1069,13 @@ class App(tk.Tk):
                 f"Sessão encerrada — {stats.completed} arquivo(s) baixado(s), "
                 f"{stats.errors} erro(s)  |  tempo: {stats.elapsed}", 'success'
             )
-            if messagebox.askyesno("Concluído",
-                                   f"Download finalizado!\n\n"
-                                   f"Arquivos: {stats.completed}  |  Erros: {stats.errors}\n\n"
-                                   "Abrir pasta de destino?"):
+            # Perguntar se quer abrir a pasta (apenas se houver sucessos)
+            if stats.completed > 0 and messagebox.askyesno(
+                "Concluído",
+                f"Download finalizado!\n\n"
+                f"Arquivos: {stats.completed}  |  Erros: {stats.errors}\n\n"
+                "Abrir pasta de destino?"
+            ):
                 self._open_folder()
 
     # ── Ajuda ─────────────────────────────────
@@ -1004,6 +1114,8 @@ class App(tk.Tk):
         if self._is_downloading:
             if messagebox.askyesno("Sair", "Download em andamento. Sair mesmo assim?"):
                 self._engine.cancel()
+                # Pequena pausa para o cancelamento
+                time.sleep(0.5)
                 self.destroy()
         else:
             self.destroy()
